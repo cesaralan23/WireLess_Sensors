@@ -1,0 +1,30 @@
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+// Proporciona propiedades 'flutter' para módulos de plugins que las esperan
+ext {
+    flutter = [
+        compileSdkVersion: 34,
+        minSdkVersion     : 23,
+        targetSdkVersion  : 34,
+        versionCode       : 1,
+        versionName       : "1.0.0",
+        ndkVersion        : "25.1.8937393"
+    ]
+}
+
+rootProject.buildDir = "../build"
+subprojects {
+    project.buildDir = "${rootProject.buildDir}/${project.name}"
+}
+subprojects {
+    project.evaluationDependsOn(":app")
+}
+
+tasks.register("clean", Delete) {
+    delete rootProject.buildDir
+}

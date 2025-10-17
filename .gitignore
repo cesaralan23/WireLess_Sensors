@@ -1,0 +1,31 @@
+# Global
+.DS_Store
+Thumbs.db
+
+# Flutter project
+provision_app_flutter/.dart_tool/
+provision_app_flutter/build/
+provision_app_flutter/.flutter-plugins
+provision_app_flutter/.flutter-plugins-dependencies
+provision_app_flutter/ios/Flutter/.last_build_id
+provision_app_flutter/android/.gradle/
+
+# Flutter web artifacts
+provision_app_flutter/web/build/
+
+# Tools (local SDKs and binaries; keep repo lean)
+tools/
+
+# Arduino outputs
+**/*.bin
+**/*.elf
+**/*.hex
+**/*.map
+arduino_sketchbook/
+
+# IDE / platform noise
+*.iml
+*.log
+.gradle/
+.idea/
+.vscode/
