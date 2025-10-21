@@ -244,6 +244,10 @@ class ProvServerCallbacks: public BLEServerCallbacks {
 
 void setup() {
   Serial.begin(115200);
+  // Inicializa WiFi en modo estación para habilitar escaneo aun sin credenciales
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+  WiFi.setSleep(false);
   // Botón reset WiFi
   pinMode(BTN_PIN, INPUT_PULLUP);
   Serial.println("Botón GPIO0 habilitado para reset WiFi (mantener 3s).");
@@ -467,8 +471,13 @@ void TaskWifiScan(void* pv) {
     if (wifiScanRequested && bleClientConnected) {
       wifiScanRequested = false;
       Serial.println("Escaneo WiFi solicitado por BLE...");
-      // Ejecutar escaneo sincrónico
-      int n = WiFi.scanNetworks();
+      // Configura escaneo robusto en modo estación, muestra SSID ocultos
+      WiFi.mode(WIFI_STA);
+      WiFi.disconnect(true);
+      WiFi.scanDelete();
+      WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+      WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
+      int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/true);
       Serial.printf("WiFi: %d redes encontradas\n", n);
       if (wifiScanResChar) {
         for (int i = 0; i < n; i++) {
