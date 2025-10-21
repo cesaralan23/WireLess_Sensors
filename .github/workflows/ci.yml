@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Enable web support
+        run: flutter config --enable-web
+        working-directory: provision_app_flutter
+
+      - name: Install dependencies
+        run: flutter pub get
+        working-directory: provision_app_flutter
+
+      - name: Analyze
+        run: flutter analyze
+        working-directory: provision_app_flutter
+
+      - name: Test
+        run: flutter test --coverage
+        working-directory: provision_app_flutter
+
+      - name: Build APK (release)
+        run: flutter build apk --release
+        working-directory: provision_app_flutter
+
+      - name: Build Web (for GitHub Pages)
+        run: flutter build web --pwa-strategy=none --base-href="/WireLess_Sensors/"
+        working-directory: provision_app_flutter
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release.apk
+          path: provision_app_flutter/build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Upload Web artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-build
+          path: provision_app_flutter/build/web
+
+      - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: provision_app_flutter/build/web
+          force_orphan: true
