@@ -3,6 +3,8 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'dart:io' show Platform;
 import 'dart:async';
+import 'dart:math' as math;
+import 'package:flutter/foundation.dart';
 
 // UUIDs del servicio/ características (deben coincidir con el ESP32)
 final Guid provService = Guid("fefefefe-1234-5678-9abc-def012345678");
@@ -37,7 +39,46 @@ class MyApp extends StatelessWidget {
     return MaterialApp(
       title: 'ESP32 WiFi Provision',
       theme: ThemeData(primarySwatch: Colors.green),
-      home: const ProvisionPage(),
+      home: const HomeShell(),
+    );
+  }
+}
+
+class HomeShell extends StatefulWidget {
+  const HomeShell({super.key});
+  @override
+  State<HomeShell> createState() => _HomeShellState();
+}
+
+class _HomeShellState extends State<HomeShell> {
+  int index = 0;
+  @override
+  Widget build(BuildContext context) {
+    final pages = [
+      const DashboardPage(),
+      const ProvisionPage(),
+    ];
+    final titles = ['Dashboard', 'Configuración'];
+    return Scaffold(
+      body: IndexedStack(index: index, children: pages),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: index,
+        onDestinationSelected: (i) => setState(() => index = i),
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.dashboard_outlined), selectedIcon: Icon(Icons.dashboard), label: 'Dashboard'),
+          NavigationDestination(icon: Icon(Icons.settings_outlined), selectedIcon: Icon(Icons.settings), label: 'Configuración'),
+        ],
+      ),
+    );
+  }
+}
+
+class DashboardPage extends StatelessWidget {
+  const DashboardPage({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return const Center(
+      child: Text('Próximamente: dashboard de sensores'),
     );
   }
 }
@@ -61,6 +102,7 @@ class _ProvisionPageState extends State<ProvisionPage> {
   final ssidCtrl = TextEditingController();
   final passCtrl = TextEditingController();
   final passFocus = FocusNode();
+  final ssidFocus = FocusNode();
   String statusText = 'idle';
   List<ScanResult> gateways = [];
   bool isScanning = false;
@@ -69,11 +111,15 @@ class _ProvisionPageState extends State<ProvisionPage> {
   bool filterPrefix = true;
   bool showPass = false;
   bool applyBusy = false;
+  bool passEnabled = true;
 
   List<WifiNet> wifiNets = [];
   bool wifiScanning = false;
   StreamSubscription<List<int>>? wifiScanSub;
+  Timer? wifiScanTimeout;
   List<MockGateway> mockGateways = [];
+  int wifiPackets = 0;
+  String lastWifiPacket = '';
 
   Color _statusColor() {
     switch (statusText) {
@@ -94,25 +140,41 @@ class _ProvisionPageState extends State<ProvisionPage> {
     }
   }
 
-  IconData _wifiBars(int rssi) {
-    // Usamos el icono de 4 barras y variamos la opacidad según RSSI
-    return Icons.signal_wifi_4_bar;
+  int _clampInt(int v, int min, int max) => v < min ? min : (v > max ? max : v);
+
+  int _rssiToPercent(int rssi) {
+    const int min = -90; // muy débil
+    const int max = -55; // excelente
+    final int clamped = _clampInt(rssi, min, max);
+    final int pct = (((clamped - min) * 100) ~/ (max - min));
+    return pct; // 0..100
   }
 
-  double _wifiOpacity(int rssi) {
-    final bars = rssi >= -55 ? 4 : rssi >= -67 ? 3 : rssi >= -80 ? 2 : 1;
-    switch (bars) {
-      case 4:
-        return 1.0;
-      case 3:
-        return 0.8;
-      case 2:
-        return 0.6;
-      default:
-        return 0.4;
-    }
+   IconData _wifiBars(int rssi) {
+    final p = _rssiToPercent(rssi);
+    return p <= 0 ? Icons.signal_wifi_0_bar : Icons.signal_wifi_4_bar;
+   }
+ 
+   double _wifiOpacity(int rssi) {
+    final p = _rssiToPercent(rssi);
+    if (p >= 75) return 1.0;
+    if (p >= 50) return 0.85;
+    if (p >= 25) return 0.65;
+    if (p > 0) return 0.45;
+    return 0.30;
   }
 
+  Color _wifiColor(int rssi) {
+    final p = _rssiToPercent(rssi);
+    if (p >= 75) return Colors.black87;
+    if (p >= 50) return Colors.grey.shade800;
+    if (p >= 25) return Colors.grey.shade600;
+    if (p > 0) return Colors.grey.shade500;
+    return Colors.grey.shade400;
+  }
+
+  // Declaraciones de WifiStrengthIcon y _WifiPainter movidas a nivel superior.
+ 
   Future<bool> _ensureBlePermissions() async {
     if (!Platform.isAndroid) return true;
     final perms = [
@@ -136,19 +198,19 @@ class _ProvisionPageState extends State<ProvisionPage> {
     setState(() => isScanning = true);
 
     final sub = FlutterBluePlus.scanResults.listen((rs) {
-      // Filtra por servicio y, opcionalmente, por prefijo del nombre
+      // Filtra por servicio o por nombre (más la opción de prefijo)
       final filtered = rs.where((r) {
         final byService = r.advertisementData.serviceUuids.contains(provService);
         final name = (r.device.platformName.isNotEmpty == true)
             ? r.device.platformName
             : (r.device.advName ?? '');
         final byPrefix = filterPrefix ? name.startsWith('ESP32-Gateway') : true;
-        return byService && byPrefix;
+        return byService || byPrefix;
       }).toList();
       setState(() => gateways = filtered);
     });
 
-    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 8), withServices: [provService]);
+    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 8));
     await FlutterBluePlus.isScanning.where((s) => s == false).first;
     await FlutterBluePlus.stopScan();
     await sub.cancel();
@@ -186,8 +248,18 @@ class _ProvisionPageState extends State<ProvisionPage> {
         await wifiScanSub?.cancel();
         wifiScanSub = wifiScanResC!.onValueReceived.listen((data) {
           final txt = String.fromCharCodes(data);
+          setState(() {
+            wifiPackets++;
+            lastWifiPacket = txt;
+          });
           if (txt == 'END') {
+            wifiScanTimeout?.cancel();
             setState(() => wifiScanning = false);
+            if (wifiNets.isEmpty) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('No se encontraron redes Wi‑Fi')),
+              );
+            }
             return;
           }
           final parts = txt.split('|');
@@ -244,33 +316,67 @@ class _ProvisionPageState extends State<ProvisionPage> {
     setState(() {
       wifiNets.clear();
       wifiScanning = true;
+      wifiPackets = 0;
+      lastWifiPacket = '';
     });
+    // Programa timeout de seguridad por si el gateway no envía END
+    wifiScanTimeout?.cancel();
+    wifiScanTimeout = Timer(const Duration(seconds: 12), () {
+      if (!mounted) return;
+      if (wifiScanning) {
+        setState(() => wifiScanning = false);
+        if (wifiNets.isEmpty) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Sin resultados de Wi‑Fi (timeout)')),
+          );
+        }
+      }
+    });
+    await wifiScanResC?.setNotifyValue(true);
     await wifiScanReqC!.write([1], withoutResponse: false);
   }
 
   void addDemoData() {
     setState(() {
-      // Limpiar anteriores para evitar duplicados
-      wifiNets.clear();
-      mockGateways.clear();
-
-      // Redes WiFi demo variadas
-      wifiNets.addAll([
-        WifiNet('WiFi Fantasma', -66, true),       // ~75% (segura)
-        WifiNet('Café Libre', -50, false),         // fuerte y abierta
-        WifiNet('Casa-2G', -80, true),             // débil y segura
-        WifiNet('', -73, true),                    // SSID oculto
-        WifiNet('Oficina', -60, true),             // media/alta y segura
-      ]);
-      wifiNets.sort((a, b) => b.rssi.compareTo(a.rssi));
-
-      // Gateways demo
       mockGateways = [
         MockGateway('ESP32-Gateway DEMO (ID 80A5CC)', -66, 'AA:BB:CC:DD:EE:FF'),
-        MockGateway('ESP32-Gateway DEMO-B (ID 123456)', -50, '11:22:33:44:55:66'),
-        MockGateway('ESP32-Gateway DEMO-C (ID ABCDEF)', -82, '77:88:99:AA:BB:CC'),
+        MockGateway('ESP32-Gateway DEMO-B (ID 123456)', -72, '11:22:33:44:55:66'),
       ];
+      wifiNets = [
+        // Fuertes
+        WifiNet('Casa', -35, true),
+        WifiNet('MiRed 5G', -58, true),
+        // Medias
+        WifiNet('MiRed 2.4G', -62, true),
+        WifiNet('IoT-Lab', -48, true),
+        // Débiles
+        WifiNet('Café Libre', -67, false),
+        WifiNet('Biblioteca', -73, true),
+        WifiNet('Oficina-Guest', -82, false),
+        // SSID oculto
+        WifiNet('', -78, true),
+        // Muy débil / abierto
+        WifiNet('OpenNet', -90, false),
+      ];
+      wifiNets.sort((a, b) => b.rssi.compareTo(a.rssi));
     });
+  }
+  void chooseNetwork(WifiNet n) {
+    setState(() {
+      ssidCtrl.text = n.ssid;
+      passEnabled = n.secure;
+      if (!n.secure) passCtrl.clear();
+    });
+    if (n.ssid.isEmpty) {
+      ssidFocus.requestFocus();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Red oculta: ingresá el SSID manualmente')),
+      );
+    } else if (n.secure) {
+      FocusScope.of(context).requestFocus(passFocus);
+    } else {
+      FocusScope.of(context).unfocus();
+    }
   }
 
   Future<void> apply() async {
@@ -285,7 +391,9 @@ class _ProvisionPageState extends State<ProvisionPage> {
     ssidCtrl.dispose();
     passCtrl.dispose();
     passFocus.dispose();
+    ssidFocus.dispose();
     wifiScanSub?.cancel();
+    wifiScanTimeout?.cancel();
     super.dispose();
   }
 
@@ -309,61 +417,64 @@ class _ProvisionPageState extends State<ProvisionPage> {
       ),
       body: Padding(
         padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
+        child: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             ElevatedButton(
               onPressed: scanAndConnect,
               child: const Text('Buscar gateways (BLE)'),
             ),
             const SizedBox(height: 8),
-            OutlinedButton.icon(
-              onPressed: addDemoData,
-              icon: const Icon(Icons.bug_report),
-              label: const Text('Cargar demo UX'),
-            ),
-            const SizedBox(height: 8),
-            Wrap(
-              spacing: 8,
-              runSpacing: 4,
-              children: [
-                OutlinedButton.icon(
-                  onPressed: () => setState(() => statusText = 'idle'),
-                  icon: const Icon(Icons.flag_outlined),
-                  label: const Text('Estado: idle'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: () => setState(() => statusText = 'awaiting'),
-                  icon: const Icon(Icons.hourglass_bottom),
-                  label: const Text('Estado: awaiting'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: () => setState(() => statusText = 'connecting'),
-                  icon: const Icon(Icons.sync),
-                  label: const Text('Estado: connecting'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: () => setState(() => statusText = 'success'),
-                  icon: const Icon(Icons.check_circle_outline),
-                  label: const Text('Estado: success'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: () => setState(() => statusText = 'fail'),
-                  icon: const Icon(Icons.error_outline),
-                  label: const Text('Estado: fail'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: () {
-                    setState(() {
-                      wifiNets.clear();
-                      mockGateways.clear();
-                    });
-                  },
-                  icon: const Icon(Icons.cleaning_services),
-                  label: const Text('Limpiar demo'),
-                ),
-              ],
-            ),
+            if (!kReleaseMode) ...[
+              OutlinedButton.icon(
+                onPressed: addDemoData,
+                icon: const Icon(Icons.bug_report),
+                label: const Text('Cargar demo UX'),
+              ),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 4,
+                children: [
+                  OutlinedButton.icon(
+                    onPressed: () => setState(() => statusText = 'idle'),
+                    icon: const Icon(Icons.flag_outlined),
+                    label: const Text('Estado: idle'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: () => setState(() => statusText = 'awaiting'),
+                    icon: const Icon(Icons.hourglass_bottom),
+                    label: const Text('Estado: awaiting'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: () => setState(() => statusText = 'connecting'),
+                    icon: const Icon(Icons.sync),
+                    label: const Text('Estado: connecting'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: () => setState(() => statusText = 'success'),
+                    icon: const Icon(Icons.check_circle_outline),
+                    label: const Text('Estado: success'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: () => setState(() => statusText = 'fail'),
+                    icon: const Icon(Icons.error_outline),
+                    label: const Text('Estado: fail'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: () {
+                      setState(() {
+                        wifiNets.clear();
+                        mockGateways.clear();
+                      });
+                    },
+                    icon: const Icon(Icons.cleaning_services),
+                    label: const Text('Limpiar demo'),
+                  ),
+                ],
+              ),
+            ],
             const SizedBox(height: 8),
             if (isScanning) const LinearProgressIndicator(),
             const SizedBox(height: 8),
@@ -371,17 +482,17 @@ class _ProvisionPageState extends State<ProvisionPage> {
             SizedBox(
               height: 180,
               child: ListView.builder(
-                itemCount: gateways.length + mockGateways.length,
+                itemCount: gateways.length + (kReleaseMode ? 0 : mockGateways.length),
                 itemBuilder: (context, i) {
                   if (i < gateways.length) {
                     final r = gateways[i];
                     final name = (r.device.platformName.isNotEmpty == true)
                         ? r.device.platformName
-                        : (r.device.advName ?? r.device.remoteId.str);
+                        : (r.device.advName ?? 'ESP32-Gateway');
                     return Card(
                       child: ListTile(
+                        leading: Icon(Icons.router, color: _wifiColor(r.rssi)),
                         title: Text(name ?? 'ESP32-Gateway'),
-                        subtitle: Text('RSSI: ${r.rssi} dBm · MAC: ${r.device.remoteId.str}'),
                         trailing: TextButton.icon(
                           onPressed: () => connectTo(r.device),
                           icon: const Icon(Icons.link),
@@ -394,8 +505,8 @@ class _ProvisionPageState extends State<ProvisionPage> {
                     final m = mockGateways[i - gateways.length];
                     return Card(
                       child: ListTile(
+                        leading: Icon(Icons.router, color: _wifiColor(m.rssi)),
                         title: Text(m.name),
-                        subtitle: Text('RSSI: ${m.rssi} dBm · MAC: ${m.mac}'),
                         trailing: TextButton.icon(
                           onPressed: () {
                             ScaffoldMessenger.of(context).showSnackBar(
@@ -428,7 +539,7 @@ class _ProvisionPageState extends State<ProvisionPage> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'Conectado a: ${connectedName.isNotEmpty ? connectedName : device!.remoteId.str}',
+                        'Conectado a: ${connectedName.isNotEmpty ? connectedName : 'ESP32-Gateway'}',
                         style: const TextStyle(fontWeight: FontWeight.w600),
                       ),
                       const SizedBox(height: 4),
@@ -454,79 +565,37 @@ class _ProvisionPageState extends State<ProvisionPage> {
                 ),
               ),
             const SizedBox(height: 12),
-            // Sección de redes WiFi escaneadas por el gateway (BLE)
-            if (device != null) ...[
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  const Text('Redes WiFi cercanas', style: TextStyle(fontWeight: FontWeight.w600)),
-                  TextButton.icon(
-                    onPressed: (wifiScanReqC != null && !wifiScanning) ? scanWifi : null,
-                    icon: const Icon(Icons.wifi_find),
-                    label: Text(wifiScanning ? 'Buscando...' : 'Buscar WiFi'),
-                  ),
-                ],
+            Container(
+              padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+              decoration: BoxDecoration(
+                color: _statusColor(),
+                borderRadius: BorderRadius.circular(8),
               ),
-              if (wifiScanning) const LinearProgressIndicator(minHeight: 2),
-              SizedBox(
-                height: 180,
-                child: ListView.builder(
-                  itemCount: wifiNets.length,
-                  itemBuilder: (context, i) {
-                    final n = wifiNets[i];
-                    return Card(
-                      child: ListTile(
-                        leading: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(_wifiBars(n.rssi), color: Colors.blueGrey.withOpacity(_wifiOpacity(n.rssi))),
-                            const SizedBox(width: 6),
-                            Icon(n.secure ? Icons.lock : Icons.lock_open, size: 16, color: Colors.grey[700]),
-                          ],
-                        ),
-                        title: Text(n.ssid.isNotEmpty ? n.ssid : '<SSID oculto>'),
-                        subtitle: Text('RSSI: ${n.rssi} dBm'),
-                        trailing: TextButton(
-                          onPressed: () {
-                            setState(() {
-                              ssidCtrl.text = n.ssid;
-                            });
-                            if (n.secure) {
-                              FocusScope.of(context).requestFocus(passFocus);
-                            }
-                          },
-                          child: const Text('Elegir'),
-                        ),
-                        onTap: () {
-                          setState(() {
-                            ssidCtrl.text = n.ssid;
-                          });
-                          if (n.secure) {
-                            FocusScope.of(context).requestFocus(passFocus);
-                          }
-                        },
-                      ),
-                    );
-                  },
-                ),
-              ),
-              const SizedBox(height: 12),
-            ],
+              child: Text('Estado: $statusText'),
+            ),
+            const SizedBox(height: 8),
+            Text('Wi‑Fi pkts: $wifiPackets'),
+            Text('Último: ${lastWifiPacket.isEmpty ? '-' : lastWifiPacket}'),
+            const SizedBox(height: 12),
+            const SizedBox(height: 8),
             TextField(
               controller: ssidCtrl,
+              focusNode: ssidFocus,
               decoration: const InputDecoration(labelText: 'SSID'),
             ),
             TextField(
               controller: passCtrl,
               focusNode: passFocus,
+              enabled: passEnabled,
               decoration: InputDecoration(
                 labelText: 'Password',
-                suffixIcon: IconButton(
-                  icon: Icon(showPass ? Icons.visibility_off : Icons.visibility),
-                  onPressed: () => setState(() => showPass = !showPass),
-                ),
-              ),
-              obscureText: !showPass,
+                helperText: passEnabled ? null : 'Red abierta: no requiere contraseña',
+                 suffixIcon: IconButton(
+                   icon: Icon(showPass ? Icons.visibility_off : Icons.visibility),
+                   onPressed: () => setState(() => showPass = !showPass),
+                 ),
+               ),
+               obscureText: !showPass,
             ),
             const SizedBox(height: 12),
             ElevatedButton(
@@ -551,17 +620,151 @@ class _ProvisionPageState extends State<ProvisionPage> {
                   : const Text('Aplicar credenciales'),
             ),
             const SizedBox(height: 12),
-            Container(
-              padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
-              decoration: BoxDecoration(
-                color: _statusColor(),
-                borderRadius: BorderRadius.circular(8),
+            // Sección de redes WiFi escaneadas por el gateway (BLE)
+            if (device != null || wifiNets.isNotEmpty) ...[
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text('Redes WiFi cercanas', style: TextStyle(fontWeight: FontWeight.w600)),
+                  Row(
+                    children: [
+                      TextButton.icon(
+                        onPressed: (wifiScanReqC != null && !wifiScanning) ? scanWifi : null,
+                        icon: const Icon(Icons.wifi_find),
+                        label: Text(wifiScanning ? 'Buscando...' : 'Buscar redes'),
+                      ),
+                      const SizedBox(width: 8),
+                      TextButton.icon(
+                        onPressed: (wifiScanResC != null) ? () => wifiScanResC!.setNotifyValue(true) : null,
+                        icon: const Icon(Icons.sync),
+                        label: const Text('Reiniciar notif.'),
+                      ),
+                    ],
+                  ),
+                ],
               ),
-              child: Text('Estado: $statusText'),
-            ),
+              if (wifiScanning) const LinearProgressIndicator(minHeight: 2),
+              SizedBox(
+                height: 180,
+                child: ListView.builder(
+                  itemCount: wifiNets.length,
+                  itemBuilder: (context, i) {
+                    final n = wifiNets[i];
+                    return Card(
+                      child: ListTile(
+                        leading: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            WifiStrengthIcon(rssi: n.rssi, size: 20),
+                            const SizedBox(width: 4),
+                            Icon(n.secure ? Icons.lock : Icons.lock_open, size: 16, color: Colors.grey[700]),
+                          ],
+                        ),
+                        title: Text(n.ssid.isNotEmpty ? n.ssid : '<SSID oculto>'),
+                        selected: ssidCtrl.text == n.ssid,
+                        selectedTileColor: Color(0xFFE8F5E9),
+                         trailing: TextButton(
+                          onPressed: () => chooseNetwork(n),
+                           child: const Text('Elegir'),
+                         ),
+                        onTap: () => chooseNetwork(n),
+                       ),
+                     );
+                  },
+                ),
+              ),
+              const SizedBox(height: 12),
+            ]
           ],
         ),
       ),
+    ),
     );
+  }
+}
+
+// Ícono WiFi con contorno + relleno por barras (0–4)
+class WifiStrengthIcon extends StatelessWidget {
+  final int rssi;
+  final double size;
+  final Color outlineColor;
+  final Color fillColor;
+  const WifiStrengthIcon({
+    super.key,
+    required this.rssi,
+    this.size = 20,
+    this.outlineColor = const Color(0xFF616161),
+    this.fillColor = const Color(0xFF212121),
+  });
+
+  int _rssiToLevel(int rssi) {
+    const int min = -90;
+    const int max = -55;
+    int v = rssi < min ? min : (rssi > max ? max : rssi);
+    int pct = (((v - min) * 100) ~/ (max - min));
+    if (pct <= 0) return 0;
+    if (pct <= 40) return 1;
+    if (pct <= 70) return 2;
+    return 3;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final level = _rssiToLevel(rssi);
+    return SizedBox(
+      width: size,
+      height: size,
+      child: CustomPaint(
+        painter: _WifiPainter(level, outlineColor, fillColor),
+      ),
+    );
+  }
+}
+
+class _WifiPainter extends CustomPainter {
+  final int level;
+  final Color outline;
+  final Color fill;
+  _WifiPainter(this.level, this.outline, this.fill);
+
+  @override
+   void paint(Canvas canvas, Size size) {
+     final center = Offset(size.width / 2, size.height * 0.88);
+     // Recorte de ángulo tipo Wi‑Fi: no dibujar semicirculo completo
+     const trim = 0.18 * math.pi; // ~32° por lado
+     final startAngle = math.pi + trim;
+     final sweep = math.pi - 2 * trim; // ~116°
+ 
+     final outlinePaint = Paint()
+       ..style = PaintingStyle.stroke
+       ..strokeWidth = size.width * 0.08
+       ..strokeCap = StrokeCap.round
+       ..color = outline;
+ 
+     final fillPaint = Paint()
+       ..style = PaintingStyle.stroke
+       ..strokeWidth = size.width * 0.08
+       ..strokeCap = StrokeCap.round
+       ..color = fill;
+ 
+     // Tres arcos en vez de cuatro, espaciados uniformemente
+     final radii = [
+       size.width * 0.28,
+       size.width * 0.42,
+       size.width * 0.56,
+     ];
+ 
+     for (int i = 0; i < radii.length; i++) {
+       final rect = Rect.fromCircle(center: center, radius: radii[i]);
+       canvas.drawArc(rect, startAngle, sweep, false, outlinePaint);
+       if (i + 1 <= level) {
+         canvas.drawArc(rect, startAngle, sweep, false, fillPaint);
+       }
+     }
+   }
+
+  @override
+  bool shouldRepaint(covariant _WifiPainter old) {
+    return old.level != level || old.outline != outline || old.fill != fill;
   }
 }
