@@ -64,6 +64,15 @@ jobs:
           name: web-build
           path: provision_app_flutter/build/web
 
+      - name: Publish APK to Releases (latest)
+        uses: marvinpinto/action-automatic-releases@v1
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          automatic_release_tag: "latest"
+          prerelease: false
+          title: "Latest APK"
+          files: provision_app_flutter/build/app/outputs/flutter-apk/app-release.apk
+
       - name: Deploy to GitHub Pages
         if: github.ref == 'refs/heads/main'
         uses: peaceiris/actions-gh-pages@v3

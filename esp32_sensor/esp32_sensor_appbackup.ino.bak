@@ -1,0 +1,64 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEAdvertising.h>
+#include "esp_sleep.h"
+
+// Configuración del ciclo
+#define ADVERTISE_MS 5000      // tiempo en ms que publicita antes de dormir
+#define SLEEP_SECONDS 60       // tiempo en deep sleep
+
+// UUID de servicio (opcional, para compatibilidad)
+#define SENSOR_SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+
+float readHumidity() {
+  // Aquí deberías leer tu sensor real (DHT, SHT, etc.).
+  // Para esta demo devolvemos un valor simulado o aleatorio.
+  static float v = 45.0;
+  v += ((float)(random(-20, 21))) / 100.0; // variar +/-0.2
+  if (v < 0) v = 0;
+  if (v > 100) v = 100;
+  return v;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("Sensor booting... (will advertise then sleep)");
+
+  float humidity = readHumidity();
+  char md_buf[32];
+  snprintf(md_buf, sizeof(md_buf), "H:%.1f", humidity);
+
+  // Inicializar BLE
+  BLEDevice::init("ESP32-Sensor");
+  BLEDevice::setPower(ESP_PWR_LVL_P3); // ajustar potencia si se desea
+
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  BLEAdvertisementData advData;
+
+  // Poner los datos en manufacturer data por simplicidad: formato "H:45.5"
+  advData.setManufacturerData(std::string(md_buf));
+
+  // También publicamos el service UUID por compatibilidad si alguien lo busca
+  advData.addServiceUUID(BLEUUID(SENSOR_SERVICE_UUID));
+
+  pAdvertising->setAdvertisementData(advData);
+  pAdvertising->setScanResponse(false);
+
+  Serial.printf("Advertising manufacturer data: %s\n", md_buf);
+  pAdvertising->start();
+
+  // Advertise por un corto periodo y luego parar y deep sleep
+  delay(ADVERTISE_MS);
+  pAdvertising->stop();
+
+  Serial.printf("Going to deep sleep for %d seconds\n", SLEEP_SECONDS);
+  esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_SECONDS * 1000000ULL);
+  delay(10);
+  esp_deep_sleep_start();
+}
+
+void loop() {
+  // No se llega aquí porque hacemos deep sleep en setup
+}

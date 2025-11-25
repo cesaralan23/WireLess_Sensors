@@ -1,10 +1,17 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:android_intent_plus/android_intent.dart';
 import 'dart:io' show Platform;
 import 'dart:async';
 import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
+import 'package:provision_app_flutter/ble_uuids.dart';
+import 'package:provision_app_flutter/ble_gateway_service.dart';
+import 'package:provision_app_flutter/widgets.dart';
+import 'package:provision_app_flutter/gateway_pages.dart';
+import 'package:wifi_scan/wifi_scan.dart';
+import 'package:provision_app_flutter/provision_guide_page.dart';
 
 // UUIDs del servicio/ características (deben coincidir con el ESP32)
 final Guid provService = Guid("fefefefe-1234-5678-9abc-def012345678");
@@ -16,6 +23,83 @@ final Guid deviceIdChar = Guid("fefefefe-1234-5678-9abc-def01234567d");
 final Guid wifiScanReqChar = Guid("fefefefe-1234-5678-9abc-def01234567e");
 final Guid wifiScanResChar = Guid("fefefefe-1234-5678-9abc-def01234567f");
 
+enum ProvisionStatus {
+  idle,
+  awaiting,
+  connecting,
+  success,
+  fail,
+  permissionDenied,
+  connectError,
+  bluetoothOff,
+  scanError,
+}
+
+String statusLabel(ProvisionStatus s) {
+  switch (s) {
+    case ProvisionStatus.awaiting:
+      return 'awaiting';
+    case ProvisionStatus.connecting:
+      return 'connecting';
+    case ProvisionStatus.success:
+      return 'success';
+    case ProvisionStatus.fail:
+      return 'fail';
+    case ProvisionStatus.permissionDenied:
+      return 'permission_denied';
+    case ProvisionStatus.connectError:
+      return 'connect_error';
+    case ProvisionStatus.bluetoothOff:
+      return 'bluetooth_off';
+    case ProvisionStatus.scanError:
+      return 'scan_error';
+    case ProvisionStatus.idle:
+    default:
+      return 'idle';
+  }
+}
+
+Color statusColor(ProvisionStatus s) {
+  switch (s) {
+    case ProvisionStatus.awaiting:
+      return Colors.amber.shade200;
+    case ProvisionStatus.connecting:
+      return Colors.blue.shade200;
+    case ProvisionStatus.success:
+      return Colors.green.shade300;
+    case ProvisionStatus.fail:
+      return Colors.red.shade300;
+    case ProvisionStatus.permissionDenied:
+      return Colors.grey.shade300;
+    case ProvisionStatus.connectError:
+      return Colors.orange.shade300;
+    case ProvisionStatus.bluetoothOff:
+      return Colors.grey.shade300;
+    case ProvisionStatus.scanError:
+      return Colors.orange.shade200;
+    case ProvisionStatus.idle:
+    default:
+      return Colors.grey.shade200;
+  }
+}
+
+ProvisionStatus parseStatusText(String txt) {
+  switch (txt.trim().toLowerCase()) {
+    case 'idle':
+      return ProvisionStatus.idle;
+    case 'awaiting':
+      return ProvisionStatus.awaiting;
+    case 'connecting':
+      return ProvisionStatus.connecting;
+    case 'success':
+      return ProvisionStatus.success;
+    case 'fail':
+      return ProvisionStatus.fail;
+    default:
+      return ProvisionStatus.idle;
+  }
+}
+
 class WifiNet {
   final String ssid;
   final int rssi;
@@ -23,12 +107,6 @@ class WifiNet {
   WifiNet(this.ssid, this.rssi, this.secure);
 }
 
-class MockGateway {
-  final String name;
-  final int rssi;
-  final String mac;
-  MockGateway(this.name, this.rssi, this.mac);
-}
 
 void main() => runApp(const MyApp());
 
@@ -55,8 +133,8 @@ class _HomeShellState extends State<HomeShell> {
   @override
   Widget build(BuildContext context) {
     final pages = [
-      const DashboardPage(),
-      const ProvisionPage(),
+      const GatewaysPage(),
+      const ProvisionGuidePage(),
     ];
     final titles = ['Dashboard', 'Configuración'];
     return Scaffold(
@@ -99,11 +177,15 @@ class _ProvisionPageState extends State<ProvisionPage> {
   BluetoothCharacteristic? wifiScanReqC;
   BluetoothCharacteristic? wifiScanResC;
 
+  // Servicio BLE modularizado
+  final BleGatewayService ble = BleGatewayService();
+
   final ssidCtrl = TextEditingController();
   final passCtrl = TextEditingController();
   final passFocus = FocusNode();
   final ssidFocus = FocusNode();
-  String statusText = 'idle';
+  ProvisionStatus status = ProvisionStatus.idle;
+  String? statusMsg;
   List<ScanResult> gateways = [];
   bool isScanning = false;
   String connectedName = '';
@@ -112,32 +194,20 @@ class _ProvisionPageState extends State<ProvisionPage> {
   bool showPass = false;
   bool applyBusy = false;
   bool passEnabled = true;
+  bool isBluetoothOn = false;
+  StreamSubscription<BluetoothAdapterState>? adapterStateSub;
 
   List<WifiNet> wifiNets = [];
   bool wifiScanning = false;
   StreamSubscription<List<int>>? wifiScanSub;
   Timer? wifiScanTimeout;
-  List<MockGateway> mockGateways = [];
   int wifiPackets = 0;
   String lastWifiPacket = '';
+  // NUEVO: suscripción para el characteristic de estado
+  StreamSubscription<List<int>>? statusSub;
 
   Color _statusColor() {
-    switch (statusText) {
-      case 'awaiting':
-        return Colors.amber.shade200;
-      case 'connecting':
-        return Colors.blue.shade200;
-      case 'success':
-        return Colors.green.shade300;
-      case 'fail':
-        return Colors.red.shade300;
-      case 'permission_denied':
-        return Colors.grey.shade300;
-      case 'connect_error':
-        return Colors.orange.shade300;
-      default:
-        return Colors.grey.shade200;
-    }
+    return statusColor(status);
   }
 
   int _clampInt(int v, int min, int max) => v < min ? min : (v > max ? max : v);
@@ -187,180 +257,262 @@ class _ProvisionPageState extends State<ProvisionPage> {
     return granted;
   }
 
-  Future<void> scanAndConnect() async {
-    final ok = await _ensureBlePermissions();
+  Future<bool> _ensureBluetoothOn() async {
+    if (!Platform.isAndroid) return true;
+
+    // Usa el estado cacheado primero; si está apagado, muestra el diálogo
+    if (!isBluetoothOn) {
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Activar Bluetooth'),
+          content: const Text('Para buscar gateways, activa el Bluetooth del teléfono.'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('Cancelar'),
+            ),
+            TextButton(
+              onPressed: () async {
+                Navigator.of(ctx).pop();
+                if (!kIsWeb && Platform.isAndroid) {
+                  try {
+                    final intent = const AndroidIntent(
+                      action: 'android.bluetooth.adapter.action.REQUEST_ENABLE',
+                    );
+                    await intent.launch();
+                  } catch (_) {}
+                }
+              },
+              child: const Text('Activar Bluetooth'),
+            ),
+          ],
+        ),
+      );
+
+      // Espera a que se active
+      try {
+        final on = await FlutterBluePlus.adapterState
+            .where((s) => s == BluetoothAdapterState.on)
+            .first
+            .timeout(const Duration(seconds: 8));
+        return on == BluetoothAdapterState.on;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    // Si el cache dice que está encendido, valida con el stream
+    try {
+      final s = await FlutterBluePlus.adapterState.first;
+      return s == BluetoothAdapterState.on;
+    } catch (_) {
+      return isBluetoothOn; // mejor esfuerzo
+    }
+  }
+
+  Future<void> scanAndConnect({bool filterPrefix = true}) async {
+    setState(() {
+      isScanning = true;
+      gateways = [];
+      status = ProvisionStatus.idle;
+      statusMsg = null;
+    });
+    await _ensureBlePermissions();
+    final ok = await _ensureBluetoothOn();
     if (!ok) {
-      setState(() => statusText = 'permission_denied');
+      setState(() {
+        isScanning = false;
+      });
       return;
     }
 
-    gateways = [];
-    setState(() => isScanning = true);
-
-    final sub = FlutterBluePlus.scanResults.listen((rs) {
-      // Filtra por servicio o por nombre (más la opción de prefijo)
-      final filtered = rs.where((r) {
-        final byService = r.advertisementData.serviceUuids.contains(provService);
-        final name = (r.device.platformName.isNotEmpty == true)
-            ? r.device.platformName
-            : (r.device.advName ?? '');
-        final byPrefix = filterPrefix ? name.startsWith('ESP32-Gateway') : true;
-        return byService || byPrefix;
-      }).toList();
-      setState(() => gateways = filtered);
-    });
-
-    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 8));
-    await FlutterBluePlus.isScanning.where((s) => s == false).first;
-    await FlutterBluePlus.stopScan();
-    await sub.cancel();
-
-    setState(() => isScanning = false);
-  }
-
-  Future<void> connectTo(BluetoothDevice d) async {
     try {
-      device = d;
-      await device!.connect(timeout: const Duration(seconds: 10));
-      final services = await device!.discoverServices();
-      for (final s in services) {
-        if (s.uuid == provService) {
-          for (final c in s.characteristics) {
-            if (c.uuid == ssidChar) ssidC = c;
-            if (c.uuid == passChar) passC = c;
-            if (c.uuid == applyChar) applyC = c;
-            if (c.uuid == statusChar) statusC = c;
-            if (c.uuid == deviceIdChar) deviceIdC = c;
-            if (c.uuid == wifiScanReqChar) wifiScanReqC = c;
-            if (c.uuid == wifiScanResChar) wifiScanResC = c;
-          }
-        }
-      }
-      if (statusC != null) {
-        await statusC!.setNotifyValue(true);
-        statusC!.onValueReceived.listen((data) {
-          setState(() => statusText = String.fromCharCodes(data));
-        });
-      }
-
-      if (wifiScanResC != null) {
-        await wifiScanResC!.setNotifyValue(true);
-        await wifiScanSub?.cancel();
-        wifiScanSub = wifiScanResC!.onValueReceived.listen((data) {
-          final txt = String.fromCharCodes(data);
+      await ble.scanGatewaysLive(
+        filterPrefix: filterPrefix,
+        timeout: const Duration(seconds: 8),
+        onUpdate: (results) {
           setState(() {
-            wifiPackets++;
-            lastWifiPacket = txt;
+            gateways = results;
           });
-          if (txt == 'END') {
-            wifiScanTimeout?.cancel();
-            setState(() => wifiScanning = false);
-            if (wifiNets.isEmpty) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('No se encontraron redes Wi‑Fi')),
-              );
-            }
-            return;
-          }
-          final parts = txt.split('|');
-          if (parts.length >= 3) {
-            final ssid = parts[0];
-            final rssi = int.tryParse(parts[1]) ?? -100;
-            final secure = parts[2] != '0';
-            setState(() {
-              wifiNets.add(WifiNet(ssid, rssi, secure));
-              wifiNets.sort((a, b) => b.rssi.compareTo(a.rssi));
-            });
-          }
-        });
-      }
-
-      connectedName = device!.platformName.isNotEmpty == true
-          ? device!.platformName
-          : (device!.advName ?? device!.remoteId.str);
-
-      // Lee el DEVICE_ID para confirmar a qué gateway hablamos
-      if (deviceIdC != null) {
-        final idBytes = await deviceIdC!.read();
-        gatewayIdText = String.fromCharCodes(idBytes);
-      }
-      setState(() {});
+        },
+      );
     } catch (e) {
-      setState(() => statusText = 'connect_error');
+      setState(() {
+        status = ProvisionStatus.scanError;
+        statusMsg = '$e';
+      });
+    } finally {
+      setState(() {
+        isScanning = false;
+      });
     }
   }
 
-  Future<void> disconnect() async {
-    try {
-      await device?.disconnect();
-    } catch (_) {}
-    await wifiScanSub?.cancel();
+  Future<void> connectTo(BluetoothDevice d) async {
     setState(() {
-      device = null;
-      ssidC = null;
-      passC = null;
-      applyC = null;
-      statusC = null;
-      deviceIdC = null;
-      wifiScanReqC = null;
-      wifiScanResC = null;
+      connectedName = d.platformName.isNotEmpty
+          ? d.platformName
+          : (d.advName.isNotEmpty ? d.advName : d.remoteId.str);
+    });
+
+    await ble.connectTo(
+      d,
+      onStatus: (txt) {
+        final st = parseStatusText(txt);
+        setState(() {
+          status = st;
+          statusMsg = null;
+          // No finalizar escaneo WiFi por estados generales; esperamos 'END' o timeout
+        });
+      },
+      onDeviceId: (idTxt) {
+        setState(() {
+          gatewayIdText = idTxt;
+        });
+      },
+      onWifiPacket: (txt) {
+        setState(() {
+          wifiPackets += 1;
+          lastWifiPacket = txt;
+        });
+        // Sanitizar posibles bytes de control/NUL y espacios
+        final s = txt.replaceAll('\u0000', '').trim();
+        if (s == 'END') {
+          setState(() {
+            wifiScanning = false;
+          });
+          return;
+        }
+        final parts = s.split('|');
+        if (parts.length >= 3) {
+          final ssid = parts[0];
+          final rssi = int.tryParse(parts[1].trim()) ?? -100;
+          final secure = parts[2].trim() != '0';
+          final net = WifiNet(ssid, rssi, secure);
+          setState(() {
+            // deduplicar por SSID
+            final existing = wifiNets.indexWhere((n) => n.ssid == ssid);
+            if (existing >= 0) {
+              wifiNets[existing] = net;
+            } else {
+              wifiNets.add(net);
+            }
+            wifiNets.sort((a, b) => b.rssi.compareTo(a.rssi));
+          });
+        }
+      },
+    );
+  }
+
+  Future<void> disconnect() async {
+    await ble.disconnect();
+    setState(() {
       connectedName = '';
       gatewayIdText = '';
+      status = ProvisionStatus.idle;
+      statusMsg = null;
+      wifiPackets = 0;
+      lastWifiPacket = '';
       wifiNets.clear();
-      wifiScanning = false;
     });
   }
 
   Future<void> scanWifi() async {
-    if (wifiScanReqC == null) return;
     setState(() {
-      wifiNets.clear();
       wifiScanning = true;
       wifiPackets = 0;
       lastWifiPacket = '';
+      wifiNets.clear();
     });
-    // Programa timeout de seguridad por si el gateway no envía END
+
+    await ble.ensureWifiNotify();
+    await ble.scanWifi();
+
     wifiScanTimeout?.cancel();
-    wifiScanTimeout = Timer(const Duration(seconds: 12), () {
-      if (!mounted) return;
-      if (wifiScanning) {
-        setState(() => wifiScanning = false);
-        if (wifiNets.isEmpty) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Sin resultados de Wi‑Fi (timeout)')),
-          );
-        }
-      }
+    wifiScanTimeout = Timer(const Duration(seconds: 10), () {
+      setState(() {
+        wifiScanning = false;
+      });
     });
-    await wifiScanResC?.setNotifyValue(true);
-    await wifiScanReqC!.write([1], withoutResponse: false);
   }
 
-  void addDemoData() {
+  Future<void> scanWifiPhone() async {
     setState(() {
-      mockGateways = [
-        MockGateway('ESP32-Gateway DEMO (ID 80A5CC)', -66, 'AA:BB:CC:DD:EE:FF'),
-        MockGateway('ESP32-Gateway DEMO-B (ID 123456)', -72, '11:22:33:44:55:66'),
-      ];
-      wifiNets = [
-        // Fuertes
-        WifiNet('Casa', -35, true),
-        WifiNet('MiRed 5G', -58, true),
-        // Medias
-        WifiNet('MiRed 2.4G', -62, true),
-        WifiNet('IoT-Lab', -48, true),
-        // Débiles
-        WifiNet('Café Libre', -67, false),
-        WifiNet('Biblioteca', -73, true),
-        WifiNet('Oficina-Guest', -82, false),
-        // SSID oculto
-        WifiNet('', -78, true),
-        // Muy débil / abierto
-        WifiNet('OpenNet', -90, false),
-      ];
-      wifiNets.sort((a, b) => b.rssi.compareTo(a.rssi));
+      wifiScanning = true;
+      wifiPackets = 0;
+      lastWifiPacket = 'phone-scan';
+      wifiNets.clear();
     });
+
+    try {
+      // Pedir permisos de ubicación / nearby wifi si están disponibles
+      try {
+        await [
+          Permission.locationWhenInUse,
+          Permission.location,
+          Permission.nearbyWifiDevices,
+        ].request();
+      } catch (_) {}
+
+      final canScan = await WiFiScan.instance.canStartScan();
+      if (canScan != CanStartScan.yes) {
+        setState(() {
+          wifiScanning = false;
+          statusMsg = 'Permisos/ubicación requeridos para escanear Wi‑Fi del teléfono';
+        });
+        return;
+      }
+
+      await WiFiScan.instance.startScan();
+      await Future.delayed(const Duration(seconds: 2));
+
+      final canGet = await WiFiScan.instance.canGetScannedResults();
+      List<WiFiAccessPoint> aps = [];
+      if (canGet == CanGetScannedResults.yes) {
+        aps = await WiFiScan.instance.getScannedResults();
+      }
+
+      final seen = <String>{};
+      final nets = <WifiNet>[];
+      for (final ap in aps) {
+        final ssid = ap.ssid ?? '';
+        if (ssid.isEmpty || seen.contains(ssid)) continue;
+        seen.add(ssid);
+        final rssi = ap.level ?? -99;
+        final caps = ap.capabilities ?? '';
+        final secure = caps.contains('WEP') || caps.contains('WPA');
+        nets.add(WifiNet(ssid, rssi, secure));
+      }
+      nets.sort((a, b) => b.rssi.compareTo(a.rssi));
+
+      setState(() {
+        wifiNets = nets;
+        wifiScanning = false;
+        statusMsg = nets.isEmpty ? 'Sin redes (teléfono)' : 'Usando redes del teléfono (' + nets.length.toString() + ')';
+      });
+    } catch (e) {
+      setState(() {
+        wifiScanning = false;
+        statusMsg = 'Fallback Wi‑Fi teléfono falló: ' + e.toString();
+      });
+    }
   }
+
+  Future<void> apply() async {
+    setState(() {
+      applyBusy = true;
+    });
+    try {
+      await ble.apply(ssidCtrl.text.trim(), passCtrl.text.trim());
+    } finally {
+      setState(() {
+        applyBusy = false;
+      });
+    }
+  }
+
+
   void chooseNetwork(WifiNet n) {
     setState(() {
       ssidCtrl.text = n.ssid;
@@ -379,21 +531,37 @@ class _ProvisionPageState extends State<ProvisionPage> {
     }
   }
 
-  Future<void> apply() async {
-    if (ssidC == null || passC == null || applyC == null) return;
-    await ssidC!.write(ssidCtrl.text.codeUnits, withoutResponse: false);
-    await passC!.write(passCtrl.text.codeUnits, withoutResponse: false);
-    await applyC!.write([1], withoutResponse: false);
+  @override
+  void initState() {
+    super.initState();
+    if (!kIsWeb && Platform.isAndroid) {
+      adapterStateSub = FlutterBluePlus.adapterState.listen((s) {
+        final on = s == BluetoothAdapterState.on;
+        setState(() {
+          isBluetoothOn = on;
+          if (!on && !isScanning) {
+            status = ProvisionStatus.bluetoothOff;
+            statusMsg = null;
+          } else if (on && status == ProvisionStatus.bluetoothOff) {
+            status = ProvisionStatus.idle;
+            statusMsg = null;
+          }
+        });
+      });
+      FlutterBluePlus.adapterState.first.then((s) {
+        final on = s == BluetoothAdapterState.on;
+        setState(() => isBluetoothOn = on);
+      }).catchError((_) {
+        setState(() => isBluetoothOn = true);
+      });
+    }
   }
 
   @override
   void dispose() {
-    ssidCtrl.dispose();
-    passCtrl.dispose();
-    passFocus.dispose();
-    ssidFocus.dispose();
-    wifiScanSub?.cancel();
     wifiScanTimeout?.cancel();
+    adapterStateSub?.cancel();
+    ble.dispose();
     super.dispose();
   }
 
@@ -404,14 +572,9 @@ class _ProvisionPageState extends State<ProvisionPage> {
         title: const Text('Provisionar Gateway ESP32'),
         actions: [
           IconButton(
-            tooltip: filterPrefix ? 'Filtrar por ESP32-Gateway-*' : 'Mostrar todos',
-            icon: Icon(filterPrefix ? Icons.filter_alt : Icons.filter_alt_off),
-            onPressed: () => setState(() => filterPrefix = !filterPrefix),
-          ),
-          IconButton(
             tooltip: 'Refrescar escaneo',
             icon: const Icon(Icons.refresh),
-            onPressed: isScanning ? null : scanAndConnect,
+            onPressed: (!isBluetoothOn || isScanning) ? null : () => scanAndConnect(filterPrefix: true),
           ),
         ],
       ),
@@ -421,60 +584,43 @@ class _ProvisionPageState extends State<ProvisionPage> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+
+            if (!isBluetoothOn)
+              Container(
+                padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 12),
+                decoration: BoxDecoration(
+                  color: Color(0xFFFFF3CD),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Color(0xFFFFEEBA)),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.bluetooth_disabled, color: Colors.orange),
+                    const SizedBox(width: 8),
+                    const Expanded(child: Text('Debes activar el Bluetooth para buscar gateways.')),
+                    TextButton(
+                      onPressed: () async {
+                        if (!kIsWeb && Platform.isAndroid) {
+                          try {
+                            final intent = const AndroidIntent(
+                              action: 'android.bluetooth.adapter.action.REQUEST_ENABLE',
+                            );
+                            await intent.launch();
+                          } catch (_) {}
+                        }
+                      },
+                      child: const Text('Activar'),
+                    ),
+                  ],
+                ),
+              ),
+            const SizedBox(height: 8),
             ElevatedButton(
-              onPressed: scanAndConnect,
+              onPressed: isBluetoothOn ? scanAndConnect : null,
               child: const Text('Buscar gateways (BLE)'),
             ),
             const SizedBox(height: 8),
-            if (!kReleaseMode) ...[
-              OutlinedButton.icon(
-                onPressed: addDemoData,
-                icon: const Icon(Icons.bug_report),
-                label: const Text('Cargar demo UX'),
-              ),
-              const SizedBox(height: 8),
-              Wrap(
-                spacing: 8,
-                runSpacing: 4,
-                children: [
-                  OutlinedButton.icon(
-                    onPressed: () => setState(() => statusText = 'idle'),
-                    icon: const Icon(Icons.flag_outlined),
-                    label: const Text('Estado: idle'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: () => setState(() => statusText = 'awaiting'),
-                    icon: const Icon(Icons.hourglass_bottom),
-                    label: const Text('Estado: awaiting'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: () => setState(() => statusText = 'connecting'),
-                    icon: const Icon(Icons.sync),
-                    label: const Text('Estado: connecting'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: () => setState(() => statusText = 'success'),
-                    icon: const Icon(Icons.check_circle_outline),
-                    label: const Text('Estado: success'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: () => setState(() => statusText = 'fail'),
-                    icon: const Icon(Icons.error_outline),
-                    label: const Text('Estado: fail'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: () {
-                      setState(() {
-                        wifiNets.clear();
-                        mockGateways.clear();
-                      });
-                    },
-                    icon: const Icon(Icons.cleaning_services),
-                    label: const Text('Limpiar demo'),
-                  ),
-                ],
-              ),
-            ],
+            
             const SizedBox(height: 8),
             if (isScanning) const LinearProgressIndicator(),
             const SizedBox(height: 8),
@@ -482,53 +628,29 @@ class _ProvisionPageState extends State<ProvisionPage> {
             SizedBox(
               height: 180,
               child: ListView.builder(
-                itemCount: gateways.length + (kReleaseMode ? 0 : mockGateways.length),
+                itemCount: gateways.length,
                 itemBuilder: (context, i) {
-                  if (i < gateways.length) {
-                    final r = gateways[i];
-                    final name = (r.device.platformName.isNotEmpty == true)
-                        ? r.device.platformName
-                        : (r.device.advName ?? 'ESP32-Gateway');
-                    return Card(
-                      child: ListTile(
-                        leading: Icon(Icons.router, color: _wifiColor(r.rssi)),
-                        title: Text(name ?? 'ESP32-Gateway'),
-                        trailing: TextButton.icon(
-                          onPressed: () => connectTo(r.device),
-                          icon: const Icon(Icons.link),
-                          label: const Text('Conectar'),
-                        ),
-                        onTap: () => connectTo(r.device),
+                  final r = gateways[i];
+                  final name = (r.device.platformName.isNotEmpty == true)
+                      ? r.device.platformName
+                      : (r.device.advName ?? 'ESP32-Gateway');
+                  return Card(
+                    child: ListTile(
+                      leading: Icon(Icons.router, color: _wifiColor(r.rssi)),
+                      title: Text(name ?? 'ESP32-Gateway'),
+                      trailing: TextButton.icon(
+                        onPressed: () => connectTo(r.device),
+                        icon: const Icon(Icons.link),
+                        label: const Text('Conectar'),
                       ),
-                    );
-                  } else {
-                    final m = mockGateways[i - gateways.length];
-                    return Card(
-                      child: ListTile(
-                        leading: Icon(Icons.router, color: _wifiColor(m.rssi)),
-                        title: Text(m.name),
-                        trailing: TextButton.icon(
-                          onPressed: () {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(content: Text('Gateway DEMO — no conectable')),
-                            );
-                          },
-                          icon: const Icon(Icons.link),
-                          label: const Text('Conectar'),
-                        ),
-                        onTap: () {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text('Gateway DEMO — no conectable')),
-                          );
-                        },
-                      ),
-                    );
-                  }
+                      onTap: () => connectTo(r.device),
+                    ),
+                  );
                 },
               ),
             ),
             const SizedBox(height: 8),
-            if (device == null)
+            if (!ble.isConnected)
               const Text('Sin conexión')
             else
               Card(
@@ -554,7 +676,7 @@ class _ProvisionPageState extends State<ProvisionPage> {
                           ),
                           const SizedBox(width: 12),
                           OutlinedButton.icon(
-                            onPressed: scanAndConnect,
+                            onPressed: isScanning ? null : () => scanAndConnect(filterPrefix: true),
                             icon: const Icon(Icons.refresh),
                             label: const Text('Re-escanear'),
                           ),
@@ -565,81 +687,39 @@ class _ProvisionPageState extends State<ProvisionPage> {
                 ),
               ),
             const SizedBox(height: 12),
-            Container(
-              padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
-              decoration: BoxDecoration(
-                color: _statusColor(),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Text('Estado: $statusText'),
-            ),
-            const SizedBox(height: 8),
-            Text('Wi‑Fi pkts: $wifiPackets'),
-            Text('Último: ${lastWifiPacket.isEmpty ? '-' : lastWifiPacket}'),
-            const SizedBox(height: 12),
-            const SizedBox(height: 8),
-            TextField(
-              controller: ssidCtrl,
-              focusNode: ssidFocus,
-              decoration: const InputDecoration(labelText: 'SSID'),
-            ),
-            TextField(
-              controller: passCtrl,
-              focusNode: passFocus,
-              enabled: passEnabled,
-              decoration: InputDecoration(
-                labelText: 'Password',
-                helperText: passEnabled ? null : 'Red abierta: no requiere contraseña',
-                 suffixIcon: IconButton(
-                   icon: Icon(showPass ? Icons.visibility_off : Icons.visibility),
-                   onPressed: () => setState(() => showPass = !showPass),
-                 ),
-               ),
-               obscureText: !showPass,
-            ),
-            const SizedBox(height: 12),
-            ElevatedButton(
-              onPressed: (device != null && ssidCtrl.text.isNotEmpty && !applyBusy)
-                  ? () async {
-                      setState(() => applyBusy = true);
-                      await apply();
-                      if (mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text('Credenciales enviadas. Verificando estado...')),
-                        );
-                      }
-                      setState(() => applyBusy = false);
-                    }
-                  : null,
-              child: applyBusy
-                  ? const SizedBox(
-                      height: 18,
-                      width: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Text('Aplicar credenciales'),
+            CredentialsForm(
+              ssidCtrl: ssidCtrl,
+              passCtrl: passCtrl,
+              ssidFocus: ssidFocus,
+              passFocus: passFocus,
+              passEnabled: passEnabled,
+              showPass: showPass,
+              applyBusy: applyBusy,
+              isConnected: ble.isConnected,
+              onToggleShowPass: () => setState(() => showPass = !showPass),
+              onApply: () async {
+                setState(() => applyBusy = true);
+                await apply();
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Credenciales enviadas. Verificando estado...')),
+                  );
+                }
+                setState(() => applyBusy = false);
+              },
+              applyColor: statusColor(status),
             ),
             const SizedBox(height: 12),
             // Sección de redes WiFi escaneadas por el gateway (BLE)
-            if (device != null || wifiNets.isNotEmpty) ...[
+            if (ble.isConnected || wifiNets.isNotEmpty) ...[
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   const Text('Redes WiFi cercanas', style: TextStyle(fontWeight: FontWeight.w600)),
-                  Row(
-                    children: [
-                      TextButton.icon(
-                        onPressed: (wifiScanReqC != null && !wifiScanning) ? scanWifi : null,
-                        icon: const Icon(Icons.wifi_find),
-                        label: Text(wifiScanning ? 'Buscando...' : 'Buscar redes'),
-                      ),
-                      const SizedBox(width: 8),
-                      TextButton.icon(
-                        onPressed: (wifiScanResC != null) ? () => wifiScanResC!.setNotifyValue(true) : null,
-                        icon: const Icon(Icons.sync),
-                        label: const Text('Reiniciar notif.'),
-                      ),
-                    ],
+                  WifiControls(
+                    canWifiScan: true,
+                    wifiScanning: wifiScanning,
+                    onScanWifi: scanWifiPhone,
                   ),
                 ],
               ),
@@ -663,13 +743,13 @@ class _ProvisionPageState extends State<ProvisionPage> {
                         title: Text(n.ssid.isNotEmpty ? n.ssid : '<SSID oculto>'),
                         selected: ssidCtrl.text == n.ssid,
                         selectedTileColor: Color(0xFFE8F5E9),
-                         trailing: TextButton(
+                        trailing: TextButton(
                           onPressed: () => chooseNetwork(n),
-                           child: const Text('Elegir'),
-                         ),
+                          child: const Text('Elegir'),
+                        ),
                         onTap: () => chooseNetwork(n),
-                       ),
-                     );
+                      ),
+                    );
                   },
                 ),
               ),

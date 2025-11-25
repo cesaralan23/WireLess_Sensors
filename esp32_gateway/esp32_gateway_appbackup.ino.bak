@@ -5,45 +5,14 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <vector>
-#include <map>
-#include <algorithm>
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
 
 // --- BLE (sensor y provisión WiFi para la APK) ---
-
-// Estructuras y estado para sensores BLE detectados
-struct SensorState {
-  float lastTemp;
-  float lastHum;
-  float lastSoilPct; // porcentaje de humedad de suelo
-  unsigned long lastSeen;
-};
-
-std::map<uint16_t, SensorState> sensorsMap;
-std::vector<uint16_t> sensorList;
-int currentScreenIndex = 0;
-SemaphoreHandle_t sensorsMutex = NULL;
-const int LEFT_BTN_PIN = 13; // botón izquierdo para rotar
-String shoutText = ""; // texto del "grito" recibido del sensor
-int autoRotateSeconds = 5; // auto-rotación por defecto (segundos). 0 = desactivar
-unsigned long sensorTimeoutMs = 6000; // suprime pantalla si no hay señales en 6s (testing)
-
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 #include <BLE2902.h>
-
-// OLED display (I2C)
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET -1
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // --- Bluetooth clásico (SPP) para provisión WiFi ---
 #include <BluetoothSerial.h>
@@ -57,7 +26,6 @@ void TaskButton(void* pv);
 void TaskSPP(void* pv);
 void TaskWeb(void* pv);
 void TaskSensor(void* pv);
-void TaskAutoRotate(void* pv); // rotación automática de pantallas
 // Nueva tarea: escaneo de redes WiFi y notificación por BLE
 void TaskWifiScan(void* pv);
 
@@ -65,28 +33,10 @@ void TaskWifiScan(void* pv);
 WebServer server(80);
 bool serverStarted = false;
 
-// Simple HTTP Basic Auth (default: user=admin pass=admin)
-// Encoded base64 of "admin:admin" is "YWRtaW46YWRtaW4="
-const String webAuthHeaderExpected = "Basic YWRtaW46YWRtaW4=";
-
-bool checkAuth() {
-  if (!server.hasHeader("Authorization")) {
-    server.sendHeader("WWW-Authenticate", "Basic realm=\"ESP32-GW\"");
-    server.send(401, "text/plain", "Unauthorized");
-    return false;
-  }
-  String auth = server.header("Authorization");
-  if (auth == webAuthHeaderExpected) return true;
-  server.sendHeader("WWW-Authenticate", "Basic realm=\"ESP32-GW\"");
-  server.send(401, "text/plain", "Unauthorized");
-  return false;
-}
-
 // --- Persistencia de credenciales ---
 Preferences prefs;
-// Valores por defecto solicitados: conectar por STA a la red del usuario
-String wifiSSID = "Sofiaycesar";
-String wifiPASS = "3764759368";
+String wifiSSID = "";
+String wifiPASS = "";
 bool wifiReady = false;
 
 // --- UUIDs del servicio BLE del sensor (lectura de humedad) ---
@@ -138,7 +88,6 @@ volatile int wifiScanIdx = -1;
 static boolean sensorDoConnect = false;
 static BLEAdvertisedDevice* sensorDevice = nullptr;
 static float humidity = 0.0f;
-static float temperature = 0.0f;
 bool sensorScanInitialized = false;
 bool sensorScanInitPending = false;
 // Botón para reset WiFi (GPIO0)
@@ -249,112 +198,26 @@ void handleBTProvision() {
 // --- Escaneo del sensor BLE ---
 class SensorScanCallbacks: public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice advertisedDevice) override {
-    // Primero: si hay Service Data, intentar parsearlo como nuestro formato binario
-    if (advertisedDevice.haveServiceData()) {
-      std::string sdata = advertisedDevice.getServiceData();
-      const uint8_t* b = (const uint8_t*)sdata.data();
-      size_t len = sdata.size();
-      // Filtrar: solo procesar/mostrar nuestro formato v1 (7 bytes, b[0] == 1)
-      if (len >= 7 && b[0] == 1) { // versión 1
-        uint16_t sensorId = (uint16_t)(b[1] | (b[2] << 8));
-        int16_t temp_x10 = (int16_t)(b[3] | (b[4] << 8));
-        uint16_t hum_x10 = (uint16_t)(b[5] | (b[6] << 8));
-        float temp = temp_x10 / 10.0f;
-        float hum = hum_x10 / 10.0f;
-        bool isNew = false;
-        if (sensorsMutex && xSemaphoreTake(sensorsMutex, (TickType_t)10) == pdTRUE) {
-          isNew = (sensorsMap.find(sensorId) == sensorsMap.end());
-          sensorsMap[sensorId].lastTemp = temp;
-          sensorsMap[sensorId].lastHum = hum;
-          sensorsMap[sensorId].lastSeen = millis();
-          xSemaphoreGive(sensorsMutex);
-        }
-        if (isNew) {
-          rebuildSensorList();
-        }
-        shoutText = ""; // Evitar que el 'shout' tape los datos del sensor
-        Serial.printf("Sensor v1 0x%04X T=%.1f H=%.1f RSSI=%d\n", sensorId, temp, hum, advertisedDevice.getRSSI());
-        updateOLEDDisplay();
-        return;
-      }
-      // No es nuestro payload, no imprimir ruido ni cortar otras rutas
-    }
-
-    // Fallback: si viene en manufacturerData en ASCII (compatibilidad), parsear
+    // Intentar parsear datos embebidos en el advertising (manufacturer data)
     std::string mdata = advertisedDevice.getManufacturerData();
     if (!mdata.empty()) {
       String md(mdata.c_str());
-      // Detectar 'SHOUT:' — mostrarlo solo si no hay sensores
-      int sIdx = md.indexOf("SHOUT:");
-      if (sIdx >= 0) {
-        String msg = md.substring(sIdx + 6);
-        shoutText = msg;
-        Serial.printf("Shout received: %s RSSI=%d\n", shoutText.c_str(), advertisedDevice.getRSSI());
-        updateOLEDDisplay();
-        return;
-      }
-      // Formato esperado: "T:23.4;H:45.5;ID=0xA5CC"; ahora también soporta "SM:xx" (soil moisture %)
-      int tIdx = md.indexOf("T:");
-      if (tIdx < 0) tIdx = md.indexOf("T=");
-      int hIdx = md.indexOf("H:");
-      if (hIdx < 0) hIdx = md.indexOf("H=");
-      int smIdx = md.indexOf("SM:");
-      if (smIdx < 0) smIdx = md.indexOf("SM=");
-      int idIdx = md.indexOf("ID:");
-      if (idIdx < 0) idIdx = md.indexOf("ID=");
-      bool updated = false;
-      if (tIdx >= 0) {
-        int end = md.indexOf(';', tIdx);
-        String val = (end >= 0) ? md.substring(tIdx+2, end) : md.substring(tIdx+2);
+      // Formato esperado: "H:45.5" o "H=45.5"
+      int idx = md.indexOf("H:");
+      if (idx < 0) idx = md.indexOf("H=");
+      if (idx >= 0) {
+        String val = md.substring(idx + 2);
         float v = val.toFloat();
-        if (!isnan(v)) { temperature = v; updated = true; }
-      }
-      if (hIdx >= 0) {
-        int end = md.indexOf(';', hIdx);
-        String val = (end >= 0) ? md.substring(hIdx+2, end) : md.substring(hIdx+2);
-        float v = val.toFloat();
-        if (!isnan(v)) { humidity = v; updated = true; }
-      }
-      float soilPct = NAN;
-      if (smIdx >= 0) {
-        int end = md.indexOf(';', smIdx);
-        String val = (end >= 0) ? md.substring(smIdx+3, end) : md.substring(smIdx+3);
-        float v = val.toFloat();
-        if (!isnan(v)) { soilPct = v; updated = true; }
-      }
-      uint16_t sid = 0; bool hasId = false;
-      if (idIdx >= 0) {
-        int end = md.indexOf(';', idIdx);
-        String val = (end >= 0) ? md.substring(idIdx+3, end) : md.substring(idIdx+3);
-        val.trim();
-        if (val.startsWith("0x") || val.startsWith("0X")) sid = (uint16_t) strtol(val.c_str(), NULL, 16);
-        else sid = (uint16_t) val.toInt();
-        hasId = true;
-      }
-      if (updated) {
-        if (hasId) {
-          bool isNew = false;
-          if (sensorsMutex && xSemaphoreTake(sensorsMutex, (TickType_t)10) == pdTRUE) {
-            isNew = (sensorsMap.find(sid) == sensorsMap.end());
-            sensorsMap[sid].lastTemp = temperature;
-            sensorsMap[sid].lastHum = humidity;
-            if (!isnan(soilPct)) sensorsMap[sid].lastSoilPct = soilPct;
-            sensorsMap[sid].lastSeen = millis();
-            xSemaphoreGive(sensorsMutex);
-          }
-          if (isNew) rebuildSensorList();
+        if (v > 0 || val == "0" || val == "0.0") {
+          humidity = v;
+          Serial.printf("Sensor advert. Humedad=%0.1f RSSI=%d\n", humidity, advertisedDevice.getRSSI());
+          return; // ya procesado desde advertising
         }
-        if (!isnan(soilPct)) {
-          Serial.printf("Sensor ASCII%s 0x%04X SM=%.1f%% RSSI=%d\n", hasId?"":" (no ID)", sid, soilPct, advertisedDevice.getRSSI());
-        } else {
-          Serial.printf("Sensor ASCII%s 0x%04X T=%.1f H=%.1f RSSI=%d\n", hasId?"":" (no ID)", sid, temperature, humidity, advertisedDevice.getRSSI());
-        }
-        updateOLEDDisplay();
-        return;
       }
     }
-
+    // Si no hay datos en advertising, usar servicio GATT como fallback
     if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(sensorServiceUUID)) {
+      // marcar para conexión por la tarea que maneja el sensor
       sensorDevice = new BLEAdvertisedDevice(advertisedDevice);
       sensorDoConnect = true;
     }
@@ -376,109 +239,14 @@ void readSensorHumidity() {
   client->disconnect();
 }
 
-// Actualiza la pantalla OLED mostrando la pantalla del sensor seleccionado
-void updateOLEDDisplay() {
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-
-  // Mostrar 'shout' solo si no hay datos de sensores
-  if (shoutText.length() > 0) {
-    bool hasSensors = false;
-    if (sensorsMutex && xSemaphoreTake(sensorsMutex, (TickType_t)20) == pdTRUE) {
-      hasSensors = !sensorList.empty();
-      xSemaphoreGive(sensorsMutex);
-    }
-    if (!hasSensors) {
-      display.setTextSize(2);
-      display.setCursor(0,16);
-      display.print(shoutText);
-      display.display();
-      return;
-    }
-  }
-
-  if (sensorsMutex && xSemaphoreTake(sensorsMutex, (TickType_t)200) == pdTRUE) {
-    int count = (int)sensorList.size();
-    if (count == 0) {
-      display.setTextSize(2);
-      display.setCursor(0,16);
-      display.print("SM:");
-      display.print(humidity,1); // fallback: usar última humedad si aún no hay SM
-      display.print("%");
-    } else {
-      uint16_t sid = sensorList[currentScreenIndex % count];
-      SensorState st = sensorsMap[sid];
-      display.setTextSize(1);
-      display.setCursor(0,0);
-      char idbuf[8];
-      snprintf(idbuf, sizeof(idbuf), "%04X", sid);
-      display.print("ID: 0x");
-      display.print(idbuf);
-      display.setCursor(0,12);
-      display.setTextSize(2);
-      display.print("SM:");
-      float sm = st.lastSoilPct;
-      if (isnan(sm)) sm = st.lastHum; // fallback si aún no hay SM
-      display.print(sm,1);
-      display.print("%");
-      display.setTextSize(1);
-      display.setCursor(90,0);
-      String pageInfo = String(currentScreenIndex+1) + "/" + String(count);
-      display.setCursor(90,0);
-      display.print(pageInfo);
-    }
-    xSemaphoreGive(sensorsMutex);
-  } else {
-    // Si no hay mutex, mostrar fallback con últimas variables globales
-    display.setTextSize(2);
-    display.setCursor(0,16);
-    display.print("No mutex");
-  }
-
-  display.display();
-}
-
 // --- Página web ---
 void handleRoot() {
-  // Requiere autenticación para ver/ajustar la UI
-  if (!checkAuth()) return;
   String html = "<!DOCTYPE html><html><head><title>ESP32 Gateway</title><meta http-equiv=\"refresh\" content=\"5\"></head><body>";
   html += "<h1>Estado del Gateway</h1>";
   html += wifiReady ? (String("<p>WiFi: conectado (IP ") + WiFi.localIP().toString() + ")</p>") : String("<p>WiFi: no conectado</p>");
-  html += "<h2>Sensores detectados</h2>";
-
-  if (sensorsMutex && xSemaphoreTake(sensorsMutex, (TickType_t)200) == pdTRUE) {
-    if (sensorList.empty()) {
-      html += "<p>No sensors detected</p>";
-    } else {
-      html += "<table border=1 cellpadding=4><tr><th>ID</th><th>Temp (C)</th><th>Soil (%)</th><th>Último</th></tr>";
-      for (size_t i = 0; i < sensorList.size(); ++i) {
-        uint16_t sid = sensorList[i];
-        SensorState st = sensorsMap[sid];
-        unsigned long age = (millis() - st.lastSeen) / 1000UL;
-        html += String("<tr><td>") + String(sid) + String("</td>");
-        html += String("<td>") + String(st.lastTemp, 1) + String("</td>");
-        float sm = st.lastSoilPct;
-        if (isnan(sm)) sm = st.lastHum; // fallback si aún no hay SM
-        html += String("<td>") + String(sm, 1) + String("</td>");
-        html += String("<td>") + String(age) + String("s</td></tr>");
-      }
-      html += "</table>";
-    }
-    xSemaphoreGive(sensorsMutex);
-  } else {
-    html += "<p>Sensors mutex unavailable</p>";
-  }
-
-  // Auto-rotación controls
-  html += String("<h2>Auto-rotación</h2>");
-  html += String("<p>Intervalo actual: <b>") + String(autoRotateSeconds) + String("</b> segundos (0 = desactivado)</p>");
-  html += String("<form method='POST' action='/set_autorotate'>");
-  html += String("Segundos: <input type='number' name='autorotate' min='0' value='") + String(autoRotateSeconds) + String("'>");
-  html += String("<input type='submit' value='Actualizar'>");
-  html += String("</form>");
+  html += "<h2>Sensor de Humedad</h2>";
+  html += "<p>Humedad: " + String(humidity, 1) + "%</p>";
   html += "<p>Configurar WiFi vía BLE usando la app de provisión.</p>";
-  html += "</body></html>";
   server.send(200, "text/html", html);
 }
 
@@ -511,27 +279,19 @@ class ProvServerCallbacks: public BLEServerCallbacks {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("SETUP: start");
   // Inicializa WiFi en modo estación para habilitar escaneo aun sin credenciales
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
   WiFi.setSleep(true);
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-  Serial.println("SETUP: WiFi mode set");
   // Botón reset WiFi
   pinMode(BTN_PIN, INPUT_PULLUP);
-  pinMode(LEFT_BTN_PIN, INPUT_PULLUP);
-  Serial.println("Botones configurados");
-  sensorsMutex = xSemaphoreCreateMutex();
-  if (sensorsMutex == NULL) Serial.println("Warning: sensorsMutex creation failed");
-  currentScreenIndex = 0;
+  Serial.println("Botón GPIO0 habilitado para reset WiFi (mantener 3s).");
 
   // Cargar credenciales almacenadas
   prefs.begin("wifi", false);
-  Serial.println("SETUP: prefs.begin done");
   wifiSSID = prefs.getString("ssid", "");
   wifiPASS = prefs.getString("pass", "");
-  Serial.printf("SETUP: prefs loaded ssid='%s' pass_len=%d\n", wifiSSID.c_str(), wifiPASS.length());
 
   // ID único del gateway basado en MAC
   String macStr = WiFi.macAddress();
@@ -542,10 +302,8 @@ void setup() {
   // Iniciar BLE primero (evita conflicto con SPP) y subir potencia
   BLEDevice::init((String("ESP32-Gateway-") + gatewayId).c_str());
   BLEDevice::setPower(ESP_PWR_LVL_P7);
-  Serial.println("SETUP: BLEDevice.init done");
   // Iniciar el servicio BLE de provisión para la APK
   startProvisioningBLE();
-  Serial.println("SETUP: startProvisioningBLE done");
   // Método alternativo: levantar SoftAP + HTTP para provisión sin BLE
   // startProvisioningAP(); // desactivado para BLE-only
   
@@ -560,7 +318,6 @@ void setup() {
 
   // Servidor web
   server.on("/", handleRoot);
-  server.on("/set_autorotate", HTTP_POST, handleSetAutoRotate);
   if (wifiReady && !serverStarted) {
     server.begin();
     serverStarted = true;
@@ -577,23 +334,11 @@ void setup() {
     Serial.println("Sensor scan callbacks registered (TaskSensor controlará los escaneos).");
   }
 
-  // Inicializar pantalla OLED
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("SSD1306 allocation failed");
-  } else {
-    display.clearDisplay();
-    display.display();
-    updateOLEDDisplay();
-    Serial.println("OLED inicializada.");
-  }
-
   // Crear tareas FreeRTOS
   xTaskCreatePinnedToCore(TaskButton, "btn", 2048, NULL, 2, NULL, 1);
   // xTaskCreatePinnedToCore(TaskSPP, "spp", 4096, NULL, 1, NULL, 1); // desactivado
   xTaskCreatePinnedToCore(TaskWeb, "web", 4096, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(TaskSensor, "sensor", 8192, NULL, 1, NULL, 1);
-  // Tarea: rotación automática de pantallas OLED
-  xTaskCreatePinnedToCore(TaskAutoRotate, "autorot", 2048, NULL, 1, NULL, 1);
   // Nueva tarea: escaneo WiFi y notificación por BLE
   xTaskCreatePinnedToCore(TaskWifiScan, "wifiscan", 6144, NULL, 1, NULL, 1);
 }
@@ -762,8 +507,6 @@ void handleScan() {
 }
 
 void handleApply() {
-  // Proteger aplicación de credenciales WiFi
-  if (!checkAuth()) return;
   String ssid = server.hasArg("ssid") ? server.arg("ssid") : "";
   String pass = server.hasArg("pass") ? server.arg("pass") : "";
   bool ok = connectWiFi(ssid, pass);
@@ -785,17 +528,6 @@ void handleStatus() {
   server.send(200, "application/json", body);
 }
 
-void handleSetAutoRotate() {
-  if (!checkAuth()) return;
-  String val = server.hasArg("autorotate") ? server.arg("autorotate") : "";
-  int sec = val.toInt();
-  if (sec < 0) sec = 0;
-  autoRotateSeconds = sec;
-  Serial.printf("Auto-rotate set to %d seconds via web\n", autoRotateSeconds);
-  server.sendHeader("Location", "/");
-  server.send(303, "text/plain", "OK");
-}
-
 void startProvisioningAP() {
   // Levantar SoftAP para provisión sin BLE
   String apName = String("ESP32-GW-") + gatewayId;
@@ -810,114 +542,7 @@ void startProvisioningAP() {
   server.on("/status", handleStatus);
   // Servir index básico
   server.on("/", handleRoot);
-  server.on("/set_autorotate", HTTP_POST, handleSetAutoRotate);
   if (!serverStarted) { server.begin(); serverStarted = true; }
-}
-
-void rebuildSensorList() {
-  if (sensorsMutex && xSemaphoreTake(sensorsMutex, (TickType_t)200) == pdTRUE) {
-    // Construir lista ordenada por lastSeen desc
-    std::vector<std::pair<uint16_t, unsigned long>> tmp;
-    for (auto const& kv : sensorsMap) tmp.push_back({kv.first, kv.second.lastSeen});
-    std::sort(tmp.begin(), tmp.end(), [](const std::pair<uint16_t,unsigned long>& a, const std::pair<uint16_t,unsigned long>& b){ return a.second > b.second; });
-    sensorList.clear();
-    for (auto& p : tmp) sensorList.push_back(p.first);
-    if (currentScreenIndex >= (int)sensorList.size()) currentScreenIndex = 0;
-    xSemaphoreGive(sensorsMutex);
-  }
-}
-
-// Elimina sensores caducados por timeout; devuelve true si eliminó alguno
-bool pruneStaleSensors() {
-  bool removed = false;
-  if (sensorsMutex && xSemaphoreTake(sensorsMutex, (TickType_t)50) == pdTRUE) {
-    unsigned long now = millis();
-    std::vector<uint16_t> expired;
-    for (auto const& kv : sensorsMap) {
-      if ((now - kv.second.lastSeen) > sensorTimeoutMs) {
-        expired.push_back(kv.first);
-      }
-    }
-    for (uint16_t sid : expired) {
-      sensorsMap.erase(sid);
-      auto it = std::find(sensorList.begin(), sensorList.end(), sid);
-      if (it != sensorList.end()) sensorList.erase(it);
-      Serial.printf("Sensor timeout: 0x%04X removed\n", sid);
-      removed = true;
-    }
-    if (currentScreenIndex >= (int)sensorList.size()) currentScreenIndex = 0;
-    xSemaphoreGive(sensorsMutex);
-  }
-  if (removed) updateOLEDDisplay();
-  return removed;
-}
-
-void TaskButton(void* pv) {
-  (void) pv;
-  int lastLeft = digitalRead(LEFT_BTN_PIN);
-  int lastRight = digitalRead(BTN_PIN);
-  unsigned long pressStartRight = 0;
-  for (;;) {
-    int left = digitalRead(LEFT_BTN_PIN);
-    int right = digitalRead(BTN_PIN);
-    // buttons are INPUT_PULLUP; pressed == LOW
-    if (left == LOW && lastLeft == HIGH) {
-      // left pressed: previous screen
-      if (sensorsMutex && xSemaphoreTake(sensorsMutex, (TickType_t)10) == pdTRUE) {
-        if (!sensorList.empty()) {
-          currentScreenIndex = (currentScreenIndex - 1 + sensorList.size()) % sensorList.size();
-        }
-        xSemaphoreGive(sensorsMutex);
-      }
-      updateOLEDDisplay();
-      vTaskDelay(200 / portTICK_PERIOD_MS); // debounce
-    }
-    if (right == LOW && lastRight == HIGH) {
-      // start press
-      pressStartRight = millis();
-    }
-    if (right == HIGH && lastRight == LOW) {
-      unsigned long pressTime = millis() - pressStartRight;
-      if (pressTime >= 3000) {
-        // long press: WiFi reset
-        Serial.println("Reset WiFi triggered by long press on GPIO0");
-        prefs.clear();
-        WiFi.disconnect(true);
-        wifiReady = false;
-      } else {
-        // short press: next screen
-        if (sensorsMutex && xSemaphoreTake(sensorsMutex, (TickType_t)10) == pdTRUE) {
-          if (!sensorList.empty()) currentScreenIndex = (currentScreenIndex + 1) % sensorList.size();
-          xSemaphoreGive(sensorsMutex);
-        }
-        updateOLEDDisplay();
-      }
-    }
-    lastLeft = left;
-    lastRight = right;
-    vTaskDelay(50 / portTICK_PERIOD_MS);
-  }
-}
-
-void TaskAutoRotate(void* pv) {
-  (void)pv;
-  for (;;) {
-    if (autoRotateSeconds <= 0) {
-      vTaskDelay(pdMS_TO_TICKS(1000));
-      continue;
-    }
-    vTaskDelay(pdMS_TO_TICKS(autoRotateSeconds * 1000));
-    // Depurar sensores caducados antes de rotar
-    pruneStaleSensors();
-    // Rotar si hay pantallas disponibles
-    if (sensorsMutex && xSemaphoreTake(sensorsMutex, (TickType_t)10) == pdTRUE) {
-      if (!sensorList.empty()) {
-        currentScreenIndex = (currentScreenIndex + 1) % sensorList.size();
-      }
-      xSemaphoreGive(sensorsMutex);
-    }
-    updateOLEDDisplay();
-  }
 }
 
 void TaskWeb(void* pv) {
@@ -949,9 +574,8 @@ void TaskSensor(void* pv) {
       sensorDevice = nullptr;
     }
 
-    // Liberar resultados, depurar sensores caducados y esperar un tiempo antes del próximo escaneo
+    // Liberar resultados y esperar un tiempo antes del próximo escaneo
     scan->clearResults();
-    pruneStaleSensors();
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 }
